@@ -1,6 +1,7 @@
 package dev.bex.icloudsync.icloud
 
 import dev.bex.icloudsync.data.model.AccountSecrets
+import dev.bex.icloudsync.data.model.MediaKind
 import dev.bex.icloudsync.security.SecretStore
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.*
@@ -13,6 +14,7 @@ import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import java.util.Base64
+import java.io.ByteArrayInputStream
 import java.util.concurrent.CopyOnWriteArrayList
 
 class ICloudAuthenticationContractTest {
@@ -106,11 +108,87 @@ class ICloudAuthenticationContractTest {
         assertTrue(requests.none { it.body.clone().readUtf8().contains("correct horse battery staple") })
     }
 
+    @Test
+    fun `photo upload stages original then atomically commits master and asset`() = runBlocking {
+        val requests = CopyOnWriteArrayList<RecordedRequest>()
+        val serviceRoot = server.url("/").toString().trimEnd('/')
+        val fingerprint = "ASanitizedContentFingerprint"
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                requests += request
+                return when {
+                    request.path!!.contains("/assets/upload?") -> json(
+                        """{"tokens":[{"url":"$serviceRoot/content"}]}""",
+                    )
+                    request.path == "/content" -> json(
+                        """{"singleFile":{"fileChecksum":"$fingerprint","size":4,"wrappingKey":"safe-key","referenceChecksum":"safe-reference","receipt":"safe-receipt"}}""",
+                    )
+                    request.path!!.contains("/records/modify?") -> {
+                        val body = Json.parseToJsonElement(request.body.clone().readUtf8()).jsonObject
+                        val records = body["operations"]!!.jsonArray.map { it.jsonObject["record"]!!.jsonObject }
+                        json(buildJsonObject { putJsonArray("records") { records.forEach(::add) } }.toString())
+                    }
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+        }
+        val secrets = MemorySecretStore().apply {
+            value = AccountSecrets(
+                appleId = "person@example.com",
+                password = "encrypted-at-rest",
+                clientId = "sanitized-client",
+                dsid = "123456789",
+                webservices = mapOf("ckdatabasews" to serviceRoot),
+            )
+        }
+        val gateway = UnofficialICloudGateway(
+            secrets,
+            Json { ignoreUnknownKeys = true; explicitNulls = false },
+            UnofficialICloudGateway.EndpointOverrides(
+                auth = server.url("/appleauth/auth").toString(),
+                setup = server.url("/setup/ws/1").toString(),
+                home = server.url("/").toString(),
+            ),
+        )
+
+        val result = gateway.uploadToPhotos(
+            PhotoUpload(
+                filename = "photo.jpg",
+                mimeType = "image/jpeg",
+                mediaKind = MediaKind.IMAGE,
+                sizeBytes = 4,
+                width = 10,
+                height = 20,
+                capturedAtEpochMs = 1_700_000_000_000,
+                source = { ByteArrayInputStream(byteArrayOf(1, 2, 3, 4)) },
+            ),
+        )
+
+        assertEquals(fingerprint, result.masterId)
+        assertFalse(result.duplicate)
+        val initialization = requests.first { it.path!!.contains("/assets/upload?") }
+            .body.clone().readUtf8().let(Json::parseToJsonElement).jsonObject
+        assertNull(initialization["tokens"]!!.jsonArray.first().jsonObject["recordName"])
+        val content = requests.first { it.path == "/content" }
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4), content.body.clone().readByteArray())
+        val commit = requests.first { it.path!!.contains("/records/modify?") }
+            .body.clone().readUtf8().let(Json::parseToJsonElement).jsonObject
+        assertTrue(commit["atomic"]!!.jsonPrimitive.boolean)
+        val operations = commit["operations"]!!.jsonArray
+        assertEquals(listOf("CPLMaster", "CPLAsset"), operations.map {
+            it.jsonObject["record"]!!.jsonObject["recordType"]!!.jsonPrimitive.content
+        })
+        val masterFields = operations.first().jsonObject["record"]!!.jsonObject["fields"]!!.jsonObject
+        assertEquals(fingerprint, masterFields["resOriginalFingerprint"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals("safe-receipt", masterFields["resOriginalRes"]!!.jsonObject["value"]!!.jsonObject["receipt"]!!.jsonPrimitive.content)
+    }
+
     private fun accountResponse(serviceRoot: String, trusted: Boolean) = json(
         """{
           "dsInfo":{"dsid":"123456789"},
           "webservices":{
             "ckdatabasews":{"url":"$serviceRoot"},
+            "photosupload":{"url":"$serviceRoot"},
             "uploadimagews":{"url":"$serviceRoot"},
             "drivews":{"url":"$serviceRoot"},
             "docws":{"url":"$serviceRoot"}

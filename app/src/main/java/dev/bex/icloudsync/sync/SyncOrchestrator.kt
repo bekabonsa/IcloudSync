@@ -67,6 +67,11 @@ class SyncOrchestrator @Inject constructor(
                 reconciliation.incremental()
             }
             reconciliation.matchLocalMedia()
+            if (!configured.stagedPhotosUploadMigrationComplete) {
+                val retried = dao.retryRetiredPhotoUploadFailures()
+                settings.setStagedPhotosUploadMigrationComplete(true)
+                if (retried > 0) progress("Retrying $retried items with the updated Photos uploader")
+            }
             dao.updateRunStage(runId, SyncStage.UPLOADING)
 
             for (media in dao.uploadCandidates()) {
@@ -85,7 +90,18 @@ class SyncOrchestrator @Inject constructor(
                         dao.updateLocalState(media.localId, BackupState.FAILED, "File is no longer readable")
                         continue
                     }
-                    val result = gateway.uploadToPhotos(media.displayName, media.sizeBytes) { mediaRepository.open(media) }
+                    val result = gateway.uploadToPhotos(
+                        PhotoUpload(
+                            filename = media.displayName,
+                            mimeType = media.mimeType,
+                            mediaKind = media.mediaKind,
+                            sizeBytes = media.sizeBytes,
+                            width = media.width,
+                            height = media.height,
+                            capturedAtEpochMs = media.capturedAtEpochMs,
+                            source = { mediaRepository.open(media) },
+                        ),
+                    )
                     dao.updateLocalState(media.localId, BackupState.VERIFYING)
                     destination = ReconciliationEngine.DESTINATION_PHOTOS
                     state = BackupState.SYNCED_PHOTOS

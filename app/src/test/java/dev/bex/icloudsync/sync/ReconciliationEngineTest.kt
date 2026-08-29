@@ -195,7 +195,7 @@ class ReconciliationEngineTest {
         override suspend fun verifyTwoFactor(code: String) = AuthResult.Authenticated
         override suspend fun validateOrRefresh() = AuthResult.Authenticated
         override suspend fun storageUsage() = ICloudStorageUsage(5_000, 1_000, 4_000, false, false, emptyList())
-        override suspend fun uploadToPhotos(filename: String, sizeBytes: Long, source: () -> InputStream) = error("Not used")
+        override suspend fun uploadToPhotos(upload: PhotoUpload) = error("Not used")
         override suspend fun uploadToDrive(path: String, sizeBytes: Long, source: () -> InputStream) = error("Not used")
         override suspend fun streamDriveItem(item: DriveItem): InputStream = error("Not used")
         override fun isConfigured() = true

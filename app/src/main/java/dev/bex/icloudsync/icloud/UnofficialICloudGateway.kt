@@ -10,6 +10,7 @@ import kotlinx.serialization.json.*
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
 import okio.source
@@ -17,6 +18,8 @@ import java.io.InputStream
 import java.net.URLEncoder
 import java.util.UUID
 import java.util.Base64
+import java.util.TimeZone
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -44,6 +47,9 @@ class UnofficialICloudGateway @Inject constructor(
         .cookieJar(cookies)
         .followRedirects(true)
         .followSslRedirects(true)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.MINUTES)
+        .writeTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
     override fun isConfigured(): Boolean = secretStore.load() != null
@@ -238,37 +244,113 @@ class UnofficialICloudGateway @Inject constructor(
         executeStream(Request.Builder().url(url).get().build(), "remote media download")
     }
 
-    override suspend fun uploadToPhotos(
-        filename: String,
-        sizeBytes: Long,
-        source: () -> InputStream,
-    ): UploadResult = withContext(Dispatchers.IO) {
-        val secrets = requireSecrets()
-        val uploadRoot = secrets.webservices["uploadimagews"]
-            ?: secrets.webservices["photosupload"]
-            ?: throw ICloudException.Protocol("Photos upload service is unavailable")
-        val url = "$uploadRoot/upload".toHttpUrl().newBuilder()
-            .addQueryParameter("dsid", secrets.dsid)
-            .addQueryParameter("filename", filename)
-            .build()
-        val response = executeJson(
-            Request.Builder().url(url).headers(commonHeaders()).post(StreamRequestBody(sizeBytes, source)).build(),
-            "Photos upload",
-        ).jsonObject
-        response["errors"]?.jsonArray?.firstOrNull()?.jsonObject?.let { error ->
-            throw mapAppleError(error["code"]?.jsonPrimitive?.contentOrNull, error["message"]?.jsonPrimitive?.contentOrNull)
+    override suspend fun uploadToPhotos(upload: PhotoUpload): UploadResult = withContext(Dispatchers.IO) {
+        val fileType = photosFileType(upload.mimeType, upload.filename)
+
+        val tokenRequest = buildJsonObject {
+            putJsonArray("tokens") {
+                addJsonObject {
+                    put("recordType", "CPLMaster")
+                    put("fieldName", "resOriginalRes")
+                }
+            }
+            putJsonObject("zoneID") { put("zoneName", PRIMARY_ZONE) }
         }
-        val records = response["records"]?.jsonArray.orEmpty().mapNotNull { it as? JsonObject }
-        val master = records.firstOrNull { it["recordType"]?.jsonPrimitive?.contentOrNull == "CPLMaster" }
-        val assetRecord = records.firstOrNull { it["recordType"]?.jsonPrimitive?.contentOrNull == "CPLAsset" }
-        val masterId = master?.get("recordName")?.jsonPrimitive?.contentOrNull
-            ?: throw ICloudException.Protocol("Photos upload did not return a master record")
-        UploadResult(
-            masterId = masterId,
-            assetId = assetRecord?.get("recordName")?.jsonPrimitive?.contentOrNull,
-            duplicate = response["isDuplicate"]?.jsonPrimitive?.booleanOrNull
-                ?: records.any { it["isDuplicate"]?.jsonPrimitive?.booleanOrNull == true },
-        )
+        val tokenEnvelope = cloudKitPost("assets/upload", tokenRequest)
+        throwIfAppleError(tokenEnvelope, "Photos upload initialization")
+        val uploadUrl = tokenEnvelope["tokens"]?.jsonArray?.firstOrNull()?.jsonObject
+            ?.get("url")?.jsonPrimitive?.contentOrNull
+            ?: throw ICloudException.Protocol("Photos upload initialization returned no target")
+
+        val contentType = upload.mimeType.toMediaTypeOrNull() ?: "application/octet-stream".toMediaType()
+        val receiptEnvelope = executeJson(
+            Request.Builder().url(uploadUrl)
+                .post(StreamRequestBody(upload.sizeBytes, upload.source, contentType))
+                .build(),
+            "Photos content upload",
+        ).jsonObject
+        val receipt = receiptEnvelope["singleFile"]?.jsonObject
+            ?: throw ICloudException.Protocol("Photos content upload returned no receipt")
+        val masterId = receipt["fileChecksum"]?.jsonPrimitive?.contentOrNull
+            ?: throw ICloudException.Protocol("Photos content receipt is missing its checksum")
+        val assetId = UUID.nameUUIDFromBytes("icloud-sync:$masterId".toByteArray())
+            .toString().uppercase()
+
+        val now = System.currentTimeMillis()
+        val captured = upload.capturedAtEpochMs.takeIf { it > 0 } ?: now
+        val width = upload.width.coerceAtLeast(0)
+        val height = upload.height.coerceAtLeast(0)
+        val modifyRequest = buildJsonObject {
+            put("atomic", true)
+            putJsonObject("zoneID") { put("zoneName", PRIMARY_ZONE) }
+            putJsonArray("operations") {
+                addJsonObject {
+                    put("operationType", "create")
+                    putJsonObject("record") {
+                        put("recordName", masterId)
+                        put("recordType", "CPLMaster")
+                        putJsonObject("fields") {
+                            putField("itemType", "STRING", JsonPrimitive(fileType))
+                            putField("dataClassType", "INT64", JsonPrimitive(if (upload.mediaKind == MediaKind.VIDEO) 2 else 1))
+                            putField(
+                                "filenameEnc",
+                                "ENCRYPTED_BYTES",
+                                JsonPrimitive(Base64.getEncoder().encodeToString(upload.filename.toByteArray())),
+                            )
+                            putField("originalOrientation", "INT64", JsonPrimitive(1))
+                            putField("importedBy", "INT64", JsonPrimitive(8))
+                            putField("importDate", "TIMESTAMP", JsonPrimitive(now))
+                            putField("originalCreationDate", "TIMESTAMP", JsonPrimitive(captured))
+                            putField("videoFrameRate", "INT64", JsonPrimitive(0))
+                            putField("resOriginalWidth", "INT64", JsonPrimitive(width))
+                            putField("resOriginalHeight", "INT64", JsonPrimitive(height))
+                            putField("resOriginalFileSize", "INT64", JsonPrimitive(upload.sizeBytes))
+                            putField("resOriginalFileType", "STRING", JsonPrimitive(fileType))
+                            putField("resOriginalFingerprint", "STRING", JsonPrimitive(masterId))
+                            putField("resOriginalRes", "ASSETID", receipt)
+                            if (upload.mediaKind == MediaKind.IMAGE) {
+                                putField("fullSizeJPEGSource", "INT64", JsonPrimitive(1))
+                            }
+                        }
+                    }
+                }
+                addJsonObject {
+                    put("operationType", "create")
+                    putJsonObject("record") {
+                        put("recordName", assetId)
+                        put("recordType", "CPLAsset")
+                        putJsonObject("fields") {
+                            putField(
+                                "masterRef",
+                                "REFERENCE",
+                                buildJsonObject { put("recordName", masterId); put("action", "NONE") },
+                            )
+                            putField("addedDate", "TIMESTAMP", JsonPrimitive(now))
+                            putField("mostRecentAddedDate", "TIMESTAMP", JsonPrimitive(now))
+                            putField("assetDate", "TIMESTAMP", JsonPrimitive(captured))
+                            putField("orientation", "INT64", JsonPrimitive(1))
+                            putField("timeZoneOffset", "INT64", JsonPrimitive(TimeZone.getDefault().getOffset(captured) / 1_000))
+                            ASSET_ZERO_FIELDS.forEach { putField(it, "INT64", JsonPrimitive(0)) }
+                        }
+                    }
+                }
+            }
+        }
+        val committed = cloudKitPost("records/modify", modifyRequest)
+        throwIfAppleError(committed, "Photos record commit")
+        val records = committed["records"]?.jsonArray.orEmpty().mapNotNull { it as? JsonObject }
+        val committedMaster = records.firstOrNull {
+            it["recordType"]?.jsonPrimitive?.contentOrNull == "CPLMaster" &&
+                it["recordName"]?.jsonPrimitive?.contentOrNull == masterId
+        }
+        val committedAsset = records.firstOrNull {
+            it["recordType"]?.jsonPrimitive?.contentOrNull == "CPLAsset" &&
+                it["recordName"]?.jsonPrimitive?.contentOrNull == assetId
+        }
+        if (committedMaster == null || committedAsset == null) {
+            throw ICloudException.Protocol("Photos record commit did not confirm the new asset")
+        }
+        UploadResult(masterId = masterId, assetId = assetId, duplicate = false)
     }
 
     override suspend fun listFallbackDriveItems(): List<DriveItem> = withContext(Dispatchers.IO) {
@@ -648,16 +730,62 @@ class UnofficialICloudGateway @Inject constructor(
         if (response.code !in accepted) {
             val retry = response.header("Retry-After")?.toLongOrNull()
             val code = response.code
+            val errorBody = response.body?.string().orEmpty()
+            val appleCode = safeAppleErrorCode(errorBody)
+            val safeDetail = safeAppleErrorDetail(errorBody)
             response.close()
             when {
+                appleCode in setOf("QUOTA_EXCEEDED", "ZONE_QUOTA_EXCEEDED", "NOT_ENOUGH_STORAGE") ->
+                    throw ICloudException.QuotaExceeded()
+                appleCode in setOf("TYPE_UNSUPPORTED", "BAD_FILE_TYPE") -> throw ICloudException.UnsupportedType()
                 code == 401 || code == 403 || code == 421 -> throw ICloudException.Authentication("$operation needs a new login")
                 code == 429 -> throw ICloudException.RateLimited(retry)
                 code >= 500 -> throw ICloudException.Transient("$operation failed temporarily")
-                code in 400..499 -> throw ICloudException.Permanent("$operation was rejected with HTTP $code")
+                code in 400..499 -> throw ICloudException.Permanent(
+                    "$operation was rejected with HTTP $code${safeDetail?.let { ": $it" }.orEmpty()}",
+                )
                 else -> throw ICloudException.Protocol("$operation returned unexpected HTTP $code")
             }
         }
         return response
+    }
+
+    private fun safeAppleErrorCode(body: String): String? {
+        if (body.isBlank()) return null
+        val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return null
+        fun JsonObject.code(): String? = this["serverErrorCode"]?.jsonPrimitive?.contentOrNull
+            ?: this["errorCode"]?.jsonPrimitive?.contentOrNull
+            ?: this["code"]?.jsonPrimitive?.contentOrNull
+        return root.code() ?: runCatching { root["errors"]?.jsonArray?.firstOrNull()?.jsonObject?.code() }.getOrNull()
+    }
+
+    private fun safeAppleErrorDetail(body: String): String? {
+        if (body.isBlank()) return null
+        val root = runCatching { json.parseToJsonElement(body) }.getOrNull() ?: return null
+        val candidates = buildList {
+            fun addPrimitive(element: JsonElement?) {
+                element?.jsonPrimitive?.contentOrNull?.takeIf(String::isNotBlank)?.let(::add)
+            }
+            if (root is JsonObject) {
+                addPrimitive(root["code"])
+                addPrimitive(root["errorCode"])
+                addPrimitive(root["reason"])
+                addPrimitive(root["message"])
+                addPrimitive(root["errorMessage"])
+                runCatching { root["errors"]?.jsonArray?.firstOrNull() }.getOrNull()?.let { error ->
+                    if (error is JsonObject) {
+                        addPrimitive(error["code"])
+                        addPrimitive(error["reason"])
+                        addPrimitive(error["message"])
+                    }
+                }
+            }
+        }
+        return candidates.joinToString(" - ")
+            .replace(Regex("https?://\\S+", RegexOption.IGNORE_CASE), "[redacted-url]")
+            .replace(Regex("(?i)(token|cookie|receipt|authorization)\\s*[=:]\\s*\\S+"), "$1=[redacted]")
+            .take(180)
+            .takeIf(String::isNotBlank)
     }
 
     private fun executeStream(request: Request, operation: String): InputStream {
@@ -717,11 +845,79 @@ class UnofficialICloudGateway @Inject constructor(
     private fun requireSecrets(): AccountSecrets = secretStore.load()
         ?: throw ICloudException.Authentication("No Apple account is configured")
 
-    private fun mapAppleError(code: String?, message: String?): ICloudException = when (code) {
-        "TYPE_UNSUPPORTED" -> ICloudException.UnsupportedType()
-        "QUOTA_EXCEEDED", "ZONE_QUOTA_EXCEEDED" -> ICloudException.QuotaExceeded()
-        "AUTHENTICATION_REQUIRED", "NOT_AUTHENTICATED" -> ICloudException.Authentication(message ?: "Login required")
-        else -> ICloudException.Protocol("Apple upload error: ${code ?: "UNKNOWN"}${message?.let { ": $it" }.orEmpty()}")
+    private fun photosFileType(mimeType: String, filename: String): String {
+        val normalized = mimeType.lowercase()
+        return when (normalized) {
+            "image/jpeg", "image/jpg" -> "public.jpeg"
+            "image/png" -> "public.png"
+            "image/heic" -> "public.heic"
+            "image/heif" -> "public.heif"
+            "image/gif" -> "com.compuserve.gif"
+            "image/tiff" -> "public.tiff"
+            "image/bmp", "image/x-ms-bmp" -> "com.microsoft.bmp"
+            "image/webp" -> "org.webmproject.webp"
+            "image/x-adobe-dng" -> "com.adobe.raw-image"
+            "video/mp4" -> "public.mpeg-4"
+            "video/quicktime" -> "com.apple.quicktime-movie"
+            "video/3gpp" -> "public.3gpp"
+            "video/webm" -> "org.webmproject.webm"
+            else -> when (filename.substringAfterLast('.', "").lowercase()) {
+                "jpg", "jpeg" -> "public.jpeg"
+                "png" -> "public.png"
+                "heic" -> "public.heic"
+                "heif" -> "public.heif"
+                "gif" -> "com.compuserve.gif"
+                "tif", "tiff" -> "public.tiff"
+                "bmp" -> "com.microsoft.bmp"
+                "webp" -> "org.webmproject.webp"
+                "dng" -> "com.adobe.raw-image"
+                "mp4", "m4v" -> "public.mpeg-4"
+                "mov" -> "com.apple.quicktime-movie"
+                "3gp" -> "public.3gpp"
+                "webm" -> "org.webmproject.webm"
+                else -> throw ICloudException.UnsupportedType()
+            }
+        }
+    }
+
+    private fun JsonObjectBuilder.putField(name: String, type: String, value: JsonElement) {
+        putJsonObject(name) {
+            put("type", type)
+            put("value", value)
+        }
+    }
+
+    private fun throwIfAppleError(root: JsonObject, operation: String) {
+        val candidates = buildList {
+            root["errors"]?.let { errors ->
+                runCatching { errors.jsonArray }.getOrNull()?.mapNotNullTo(this) { it as? JsonObject }
+            }
+            listOf("tokens", "records", "results").forEach { key ->
+                root[key]?.let { values ->
+                    runCatching { values.jsonArray }.getOrNull()?.mapNotNullTo(this) { it as? JsonObject }
+                }
+            }
+        }
+        val error = candidates.firstOrNull {
+            it["serverErrorCode"]?.jsonPrimitive?.contentOrNull != null ||
+                it["errorCode"]?.jsonPrimitive?.contentOrNull != null ||
+                it["code"]?.jsonPrimitive?.contentOrNull != null
+        } ?: return
+        val code = error["serverErrorCode"]?.jsonPrimitive?.contentOrNull
+            ?: error["errorCode"]?.jsonPrimitive?.contentOrNull
+            ?: error["code"]?.jsonPrimitive?.contentOrNull
+        val message = error["reason"]?.jsonPrimitive?.contentOrNull
+            ?: error["message"]?.jsonPrimitive?.contentOrNull
+        throw when (code) {
+            "TYPE_UNSUPPORTED", "BAD_FILE_TYPE" -> ICloudException.UnsupportedType()
+            "QUOTA_EXCEEDED", "ZONE_QUOTA_EXCEEDED", "NOT_ENOUGH_STORAGE" -> ICloudException.QuotaExceeded()
+            "AUTHENTICATION_REQUIRED", "NOT_AUTHENTICATED" ->
+                ICloudException.Authentication("$operation needs a new login")
+            "TRY_AGAIN_LATER", "SERVICE_UNAVAILABLE" -> ICloudException.Transient("$operation failed temporarily")
+            else -> ICloudException.Protocol(
+                "$operation failed: ${code ?: "UNKNOWN"}${message?.let { ": ${it.take(120)}" }.orEmpty()}",
+            )
+        }
     }
 
     internal fun parseStorageUsage(response: JsonObject): ICloudStorageUsage {
@@ -759,8 +955,9 @@ class UnofficialICloudGateway @Inject constructor(
     private class StreamRequestBody(
         private val length: Long,
         private val opener: () -> InputStream,
+        private val mediaType: MediaType = "application/octet-stream".toMediaType(),
     ) : RequestBody() {
-        override fun contentType(): MediaType = "application/octet-stream".toMediaType()
+        override fun contentType(): MediaType = mediaType
         override fun contentLength(): Long = length
         override fun writeTo(sink: BufferedSink) { opener().use { sink.writeAll(it.source()) } }
     }
@@ -823,6 +1020,12 @@ class UnofficialICloudGateway @Inject constructor(
         const val ROOT_FOLDER = "FOLDER::com.apple.CloudDocs::root"
         val JSON_MEDIA_TYPE = "application/json".toMediaType()
         val TEXT_MEDIA_TYPE = "text/plain".toMediaType()
+        val ASSET_ZERO_FIELDS = listOf(
+            "adjustmentRenderType", "adjustmentSourceType", "assetHDRType", "assetSubtype", "assetSubtypeV2",
+            "burstFlags", "customRenderedValue", "duration", "facesVersion", "isFavorite", "isHidden",
+            "originalChoice", "playCount", "shareCount", "trashReason", "vidComplDispScale", "vidComplDispValue",
+            "vidComplDurScale", "vidComplDurValue", "vidComplVisibilityState", "viewCount",
+        )
         val DESIRED_KEYS = listOf(
             "filenameEnc", "itemType", "addedDate", "masterRef", "isDeleted", "isHidden",
             "resOriginalRes", "resOriginalFingerprint", "resOriginalFileType", "resOriginalWidth", "resOriginalHeight",

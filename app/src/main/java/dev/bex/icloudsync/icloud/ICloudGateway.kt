@@ -33,6 +33,17 @@ data class UploadResult(
     val duplicate: Boolean,
 )
 
+data class PhotoUpload(
+    val filename: String,
+    val mimeType: String,
+    val mediaKind: MediaKind,
+    val sizeBytes: Long,
+    val width: Int,
+    val height: Int,
+    val capturedAtEpochMs: Long,
+    val source: () -> InputStream,
+)
+
 data class DriveItem(
     val driveId: String,
     val path: String,
@@ -77,7 +88,7 @@ interface ICloudGateway {
     suspend fun listPhotos(continuation: String? = null, hidden: Boolean = false): RemotePage
     suspend fun listChanges(syncToken: String): RemotePage
     suspend fun streamRemoteOriginal(asset: RemoteAsset): InputStream
-    suspend fun uploadToPhotos(filename: String, sizeBytes: Long, source: () -> InputStream): UploadResult
+    suspend fun uploadToPhotos(upload: PhotoUpload): UploadResult
     suspend fun listFallbackDriveItems(): List<DriveItem>
     suspend fun uploadToDrive(path: String, sizeBytes: Long, source: () -> InputStream): DriveItem
     suspend fun streamDriveItem(item: DriveItem): InputStream

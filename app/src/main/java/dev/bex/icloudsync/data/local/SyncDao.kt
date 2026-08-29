@@ -36,6 +36,18 @@ interface SyncDao {
     @Query("UPDATE local_media SET backupState = CASE WHEN sha256 IS NULL THEN 'DISCOVERED' ELSE 'PENDING' END, lastError = NULL WHERE present = 1 AND backupState IN ('HASHING', 'UPLOADING', 'VERIFYING')")
     suspend fun recoverInterruptedStates()
 
+    @Query("""
+        UPDATE local_media
+        SET backupState = CASE WHEN sha256 IS NULL THEN 'DISCOVERED' ELSE 'PENDING' END, lastError = NULL
+        WHERE present = 1 AND backupState = 'FAILED' AND (
+            lastError LIKE 'Photos upload was rejected with HTTP 400%' OR
+            lastError LIKE 'Photos upload was rejected with HTTP 410%' OR
+            lastError LIKE 'Photos upload was rejected with HTTP 413%' OR
+            lastError = 'Protocol response was not understood'
+        )
+    """)
+    suspend fun retryRetiredPhotoUploadFailures(): Int
+
     @Query("SELECT * FROM remote_assets WHERE sha256 = :hash AND deleted = 0 LIMIT 1")
     suspend fun remoteByHash(hash: String): RemoteAssetEntity?
 

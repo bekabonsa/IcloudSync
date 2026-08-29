@@ -18,6 +18,7 @@ data class SettingsState(
     val chargingOnly: Boolean = false,
     val completionNotifications: Boolean = false,
     val excludedFolders: Set<String> = emptySet(),
+    val stagedPhotosUploadMigrationComplete: Boolean = false,
 )
 
 @Singleton
@@ -30,6 +31,7 @@ class AppSettings @Inject constructor(@ApplicationContext private val context: C
             chargingOnly = prefs[CHARGING_ONLY] ?: false,
             completionNotifications = prefs[COMPLETION_NOTIFICATIONS] ?: false,
             excludedFolders = prefs[EXCLUDED_FOLDERS] ?: emptySet(),
+            stagedPhotosUploadMigrationComplete = prefs[STAGED_PHOTOS_UPLOAD_MIGRATED] ?: false,
         )
     }
 
@@ -39,6 +41,7 @@ class AppSettings @Inject constructor(@ApplicationContext private val context: C
     suspend fun setChargingOnly(value: Boolean) = edit(CHARGING_ONLY, value)
     suspend fun setCompletionNotifications(value: Boolean) = edit(COMPLETION_NOTIFICATIONS, value)
     suspend fun setExcludedFolders(value: Set<String>) { context.dataStore.edit { it[EXCLUDED_FOLDERS] = value } }
+    suspend fun setStagedPhotosUploadMigrationComplete(value: Boolean) = edit(STAGED_PHOTOS_UPLOAD_MIGRATED, value)
 
     suspend fun reset() { context.dataStore.edit { it.clear() } }
 
@@ -53,5 +56,6 @@ class AppSettings @Inject constructor(@ApplicationContext private val context: C
         val CHARGING_ONLY = booleanPreferencesKey("charging_only")
         val COMPLETION_NOTIFICATIONS = booleanPreferencesKey("completion_notifications")
         val EXCLUDED_FOLDERS = stringSetPreferencesKey("excluded_folders")
+        val STAGED_PHOTOS_UPLOAD_MIGRATED = booleanPreferencesKey("staged_photos_upload_migrated")
     }
 }
