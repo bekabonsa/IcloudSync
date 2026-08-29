@@ -1,0 +1,74 @@
+# Gradle and Kotlin generated state
+.gradle/
+.kotlin/
+**/build/
+build-cache/
+out/
+
+# Local Android SDK/NDK configuration
+local.properties
+local.defaults.properties
+.externalNativeBuild/
+.cxx/
+obj/
+
+# Android Studio, IntelliJ, VS Code, and Fleet
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.fleet/
+
+# Compiled and packaged Android artifacts
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Signing keys and machine-local signing configuration
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+keystore.properties
+signing.properties
+
+# Credentials and local environment overrides
+.env
+.env.*
+!.env.example
+secrets.properties
+credentials.properties
+/credentials/
+/private/
+/sessions/
+
+# Network captures and diagnostics may contain Apple tokens or signed URLs
+captures/
+*.har
+*.pcap
+*.pcapng
+/diagnostics/
+/exports/
+
+# Logs, crash dumps, and profiler output
+*.log
+*.hprof
+*.trace
+hs_err_pid*
+
+# OS metadata and temporary editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# Keep the Gradle wrapper and exported Room schemas under version control.
+!gradle/wrapper/gradle-wrapper.jar
+!app/schemas/**
