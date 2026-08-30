@@ -1,6 +1,6 @@
 # iCloud Sync for Android
 
-Personal Android 10+ media backup client for iCloud Photos. It uses Apple's private iCloud.com web services, so it may stop working when Apple changes those services and is intentionally designed to safe-stop rather than guess.
+Personal Android 10+ media backup client for iCloud Photos. It uses Apple's private iCloud.com web services, so it may stop working when Apple changes those services.
 
 ## Build
 
