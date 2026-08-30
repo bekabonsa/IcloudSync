@@ -242,6 +242,24 @@ private fun MainShell(state: MainUiState, viewModel: MainViewModel, requestAcces
 private fun DashboardScreen(state: MainUiState, viewModel: MainViewModel, requestAccess: () -> Unit) {
     val protected = state.protected.size
     val total = state.included.size
+    val pending = state.media.count {
+        it.backupState in setOf(
+            BackupState.DISCOVERED,
+            BackupState.HASHING,
+            BackupState.PENDING,
+            BackupState.UPLOADING,
+            BackupState.VERIFYING,
+        )
+    }
+    val attention = state.media.count {
+        it.backupState in setOf(
+            BackupState.FAILED,
+            BackupState.REMOTE_REMOVED,
+            BackupState.BLOCKED_AUTH,
+            BackupState.BLOCKED_PERMISSION,
+            BackupState.BLOCKED_QUOTA,
+        )
+    }
     var authenticationCode by rememberSaveable { mutableStateOf("") }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -349,8 +367,36 @@ private fun DashboardScreen(state: MainUiState, viewModel: MainViewModel, reques
         }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                MetricCard("Pending", state.media.count { it.backupState in setOf(BackupState.DISCOVERED, BackupState.HASHING, BackupState.PENDING, BackupState.UPLOADING, BackupState.VERIFYING) }, Icons.Default.Schedule, Modifier.weight(1f))
-                MetricCard("Attention", state.media.count { it.backupState in setOf(BackupState.FAILED, BackupState.REMOTE_REMOVED, BackupState.BLOCKED_AUTH, BackupState.BLOCKED_PERMISSION, BackupState.BLOCKED_QUOTA) }, Icons.Default.ErrorOutline, Modifier.weight(1f))
+                MetricCard("Pending", pending, Icons.Default.Schedule, Modifier.weight(1f))
+                MetricCard("Attention", attention, Icons.Default.ErrorOutline, Modifier.weight(1f))
+            }
+        }
+        if (pending > 0 || attention > 0) {
+            item {
+                ElevatedCard {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (pending > 0) {
+                            Text("$pending queued", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Pending items have not failed. They upload one at a time and resume automatically after network or server retry delays.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (attention > 0) {
+                            Text("$attention need attention", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Open Library, choose Action needed or Failed, then tap an item to see the reason and available action.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        state.latestRun?.errorSummary?.takeIf(String::isNotBlank)?.let { reason ->
+                            HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                            Text("Last run: $reason", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
             }
         }
         item {
@@ -376,12 +422,32 @@ private fun LibraryScreen(media: List<LocalMediaEntity>, viewModel: MainViewMode
         "Excluded" to setOf(BackupState.EXCLUDED),
     )
     var selected by rememberSaveable { mutableStateOf("All") }
+    var selectedItemId by rememberSaveable { mutableStateOf<String?>(null) }
     val visible = filters.first { it.first == selected }.second.let { states -> media.filter { it.backupState in states } }
+    val selectedItem = media.firstOrNull { it.localId == selectedItemId }
     Column(Modifier.fillMaxSize()) {
         Text("Library", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, modifier = Modifier.padding(20.dp, 20.dp, 20.dp, 8.dp))
         androidx.compose.foundation.lazy.LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(filters) { filter -> FilterChip(selected = selected == filter.first, onClick = { selected = filter.first }, label = { Text(filter.first) }) }
+            items(filters) { filter ->
+                val count = media.count { it.backupState in filter.second }
+                FilterChip(
+                    selected = selected == filter.first,
+                    onClick = { selected = filter.first },
+                    label = { Text("${filter.first} ($count)") },
+                )
+            }
         }
+        Text(
+            when (selected) {
+                "Pending" -> "Queued items are waiting for their turn; they have not failed."
+                "Uploading" -> "These items are being hashed, transferred, or verified by iCloud."
+                "Action needed", "Failed" -> "Tap an item to see its full reason and recovery action."
+                else -> "Tap any item for backup details."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+        )
         if (visible.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No items in this view", color = MaterialTheme.colorScheme.onSurfaceVariant) }
         else LazyVerticalGrid(
             columns = GridCells.Adaptive(108.dp),
@@ -389,14 +455,26 @@ private fun LibraryScreen(media: List<LocalMediaEntity>, viewModel: MainViewMode
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            items(visible, key = { it.localId }) { item -> MediaTile(item, viewModel::retryItem) }
+            items(visible, key = { it.localId }) { item ->
+                MediaTile(item, onOpen = { selectedItemId = item.localId })
+            }
         }
+    }
+    selectedItem?.let { item ->
+        MediaDetailsDialog(
+            item = item,
+            onDismiss = { selectedItemId = null },
+            onRetry = {
+                viewModel.retryItem(item.localId)
+                selectedItemId = null
+            },
+        )
     }
 }
 
 @Composable
-private fun MediaTile(item: LocalMediaEntity, retry: (String) -> Unit) {
-    ElevatedCard {
+private fun MediaTile(item: LocalMediaEntity, onOpen: () -> Unit) {
+    ElevatedCard(onClick = onOpen) {
         Column {
             Box(Modifier.aspectRatio(1f).background(Color.LightGray)) {
                 AsyncImage(model = item.contentUri, contentDescription = item.displayName, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
@@ -417,19 +495,94 @@ private fun MediaTile(item: LocalMediaEntity, retry: (String) -> Unit) {
             item.lastError?.let { error ->
                 Text(
                     error,
-                    maxLines = 2,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.padding(horizontal = 7.dp),
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
                 )
             }
-            if (item.backupState in setOf(BackupState.REMOTE_REMOVED, BackupState.BLOCKED_QUOTA, BackupState.FAILED)) {
-                TextButton(onClick = { retry(item.localId) }, contentPadding = PaddingValues(horizontal = 7.dp, vertical = 0.dp)) {
-                    Text(if (item.backupState == BackupState.REMOTE_REMOVED) "Back up again" else "Retry")
+            Text(
+                statusLabel(item.backupState),
+                style = MaterialTheme.typography.labelSmall,
+                color = statusColor(item.backupState),
+                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun MediaDetailsDialog(
+    item: LocalMediaEntity,
+    onDismiss: () -> Unit,
+    onRetry: () -> Unit,
+) {
+    val canRetry = item.backupState in setOf(
+        BackupState.FAILED,
+        BackupState.REMOTE_REMOVED,
+        BackupState.BLOCKED_QUOTA,
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(statusIcon(item.backupState), null, tint = statusColor(item.backupState)) },
+        title = { Text(item.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+        text = {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                item {
+                    Text(statusLabel(item.backupState), fontWeight = FontWeight.Bold, color = statusColor(item.backupState))
+                    Text(
+                        statusExplanation(item.backupState),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                item.lastError?.takeIf(String::isNotBlank)?.let { error ->
+                    item {
+                        HorizontalDivider()
+                        Text(
+                            if (item.backupState == BackupState.PENDING) "Last attempt" else "Reported error",
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(error, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                item {
+                    HorizontalDivider()
+                    DetailRow("Type", item.mimeType)
+                    DetailRow("Size", formatBytes(item.sizeBytes))
+                    DetailRow("Folder", item.relativePath.ifBlank { "Unknown" })
+                    DetailRow(
+                        "Captured",
+                        item.capturedAtEpochMs.takeIf { it > 0L }
+                            ?.let { DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(it)) }
+                            ?: "Unknown",
+                    )
                 }
             }
-        }
+        },
+        confirmButton = {
+            if (canRetry) {
+                TextButton(onClick = onRetry) {
+                    Text(if (item.backupState == BackupState.REMOTE_REMOVED) "Back up again" else "Retry now")
+                }
+            } else {
+                TextButton(onClick = onDismiss) { Text("Close") }
+            }
+        },
+        dismissButton = if (canRetry) {
+            { TextButton(onClick = onDismiss) { Text("Close") } }
+        } else {
+            null
+        },
+    )
+}
+
+@Composable
+private fun DetailRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(68.dp))
+        Text(value, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
     }
 }
 
@@ -558,6 +711,36 @@ private fun stageLabel(state: MainUiState): String = when (state.latestRun?.stag
     SyncStage.PROTOCOL_STOPPED -> "Update required"
     SyncStage.PAUSED -> "Waiting to retry"
     else -> if (state.protected.size == state.included.size && state.included.isNotEmpty()) "Everything is protected" else "Monitoring for new media"
+}
+private fun statusLabel(state: BackupState): String = when (state) {
+    BackupState.DISCOVERED -> "Discovered"
+    BackupState.HASHING -> "Preparing"
+    BackupState.PENDING -> "Pending"
+    BackupState.UPLOADING -> "Uploading"
+    BackupState.VERIFYING -> "Verifying"
+    BackupState.SYNCED_PHOTOS -> "Protected in Photos"
+    BackupState.SYNCED_DRIVE -> "Protected in Drive"
+    BackupState.REMOTE_REMOVED -> "Removed from iCloud"
+    BackupState.BLOCKED_AUTH -> "Apple verification needed"
+    BackupState.BLOCKED_PERMISSION -> "Media access needed"
+    BackupState.BLOCKED_QUOTA -> "iCloud storage full"
+    BackupState.FAILED -> "Failed"
+    BackupState.EXCLUDED -> "Excluded"
+}
+private fun statusExplanation(state: BackupState): String = when (state) {
+    BackupState.DISCOVERED -> "The item was found on this phone and is waiting to be prepared."
+    BackupState.HASHING -> "The app is calculating the item's exact fingerprint before matching or uploading it."
+    BackupState.PENDING -> "The item is safely queued. Uploads run one at a time and automatically continue after retry delays."
+    BackupState.UPLOADING -> "The original bytes are currently being sent to iCloud."
+    BackupState.VERIFYING -> "The upload finished and the app is waiting for valid iCloud asset records."
+    BackupState.SYNCED_PHOTOS -> "An exact copy is present in your iCloud Photos library."
+    BackupState.SYNCED_DRIVE -> "Apple Photos did not accept this format, so the unchanged original is protected in the iCloud Drive fallback folder."
+    BackupState.REMOTE_REMOVED -> "The matched iCloud asset was removed remotely. It will not be recreated unless you choose Back up again."
+    BackupState.BLOCKED_AUTH -> "Sync is paused until your Apple account session is verified in the app."
+    BackupState.BLOCKED_PERMISSION -> "Sync is paused until the app has full photo and video access."
+    BackupState.BLOCKED_QUOTA -> "There is not enough iCloud storage for this upload. Free space or upgrade storage, then retry."
+    BackupState.FAILED -> "This item could not be protected automatically. Review the reported error below, then retry if appropriate."
+    BackupState.EXCLUDED -> "This item's folder is excluded by your backup settings."
 }
 private fun statusColor(state: BackupState): Color = when (state) { BackupState.SYNCED_PHOTOS -> CloudBlue; BackupState.SYNCED_DRIVE -> DrivePurple; BackupState.FAILED, BackupState.REMOTE_REMOVED, BackupState.BLOCKED_AUTH, BackupState.BLOCKED_PERMISSION, BackupState.BLOCKED_QUOTA -> Color(0xFFE04B4B); BackupState.EXCLUDED -> Color.Gray; else -> Color(0xFFF39A32) }
 private fun statusIcon(state: BackupState) = when (state) { BackupState.SYNCED_PHOTOS, BackupState.SYNCED_DRIVE -> Icons.Default.Check; BackupState.FAILED, BackupState.REMOTE_REMOVED, BackupState.BLOCKED_AUTH, BackupState.BLOCKED_PERMISSION, BackupState.BLOCKED_QUOTA -> Icons.Default.PriorityHigh; BackupState.EXCLUDED -> Icons.Default.Remove; else -> Icons.Default.Schedule }

@@ -90,30 +90,52 @@ class SyncOrchestrator @Inject constructor(
                         dao.updateLocalState(media.localId, BackupState.FAILED, "File is no longer readable")
                         continue
                     }
-                    val result = gateway.uploadToPhotos(
-                        PhotoUpload(
-                            filename = media.displayName,
-                            mimeType = media.mimeType,
-                            mediaKind = media.mediaKind,
-                            sizeBytes = media.sizeBytes,
-                            width = media.width,
-                            height = media.height,
-                            capturedAtEpochMs = media.capturedAtEpochMs,
-                            source = { mediaRepository.open(media) },
+                    val photoResult = try {
+                        gateway.uploadToPhotos(
+                            PhotoUpload(
+                                filename = media.displayName,
+                                mimeType = media.mimeType,
+                                mediaKind = media.mediaKind,
+                                sizeBytes = media.sizeBytes,
+                                width = media.width,
+                                height = media.height,
+                                capturedAtEpochMs = media.capturedAtEpochMs,
+                                source = { mediaRepository.open(media) },
+                            ),
+                        )
+                    } catch (_: ICloudException.UnsupportedType) {
+                        null
+                    }
+                    if (photoResult != null) {
+                        dao.updateLocalState(media.localId, BackupState.VERIFYING)
+                        destination = ReconciliationEngine.DESTINATION_PHOTOS
+                        state = BackupState.SYNCED_PHOTOS
+                        remoteId = photoResult.masterId
+                        persistUploadedRemote(media, hash, destination, photoResult.masterId, photoResult.assetId)
+                    } else {
+                        remotePath = fallbackDrivePath(media.displayName, media.capturedAtEpochMs, hash)
+                        val driveResult = gateway.uploadToDrive(remotePath, media.sizeBytes) { mediaRepository.open(media) }
+                        destination = ReconciliationEngine.DESTINATION_DRIVE
+                        state = BackupState.SYNCED_DRIVE
+                        remoteId = "drive:${driveResult.driveId}"
+                        persistUploadedRemote(media, hash, destination, remoteId, null)
+                    }
+                } catch (_: ICloudException.UnsupportedType) {
+                    val message = "iCloud Drive does not support this file"
+                    dao.updateLocalState(media.localId, BackupState.FAILED, message)
+                    dao.upsertBackupRecord(
+                        BackupRecordEntity(
+                            localId = media.localId,
+                            contentHash = hash,
+                            state = BackupState.FAILED,
+                            destination = null,
+                            remoteId = null,
+                            remotePath = remotePath,
+                            lastError = message,
+                            updatedAtEpochMs = System.currentTimeMillis(),
                         ),
                     )
-                    dao.updateLocalState(media.localId, BackupState.VERIFYING)
-                    destination = ReconciliationEngine.DESTINATION_PHOTOS
-                    state = BackupState.SYNCED_PHOTOS
-                    remoteId = result.masterId
-                    persistUploadedRemote(media, hash, destination, result.masterId, result.assetId)
-                } catch (_: ICloudException.UnsupportedType) {
-                    remotePath = fallbackDrivePath(media.displayName, media.capturedAtEpochMs, hash)
-                    val result = gateway.uploadToDrive(remotePath, media.sizeBytes) { mediaRepository.open(media) }
-                    destination = ReconciliationEngine.DESTINATION_DRIVE
-                    state = BackupState.SYNCED_DRIVE
-                    remoteId = "drive:${result.driveId}"
-                    persistUploadedRemote(media, hash, destination, remoteId, null)
+                    continue
                 } catch (error: ICloudException.Permanent) {
                     dao.updateLocalState(media.localId, BackupState.FAILED, error.message?.take(160))
                     dao.upsertBackupRecord(
